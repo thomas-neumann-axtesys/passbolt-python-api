@@ -1,7 +1,9 @@
 import configparser
+import datetime
 import json
 import logging
 import urllib.parse
+import uuid
 from typing import List, Mapping, Optional, Tuple, Union
 
 import gnupg
@@ -46,13 +48,14 @@ class PassboltError(Exception):
 
 class APIClient:
     def __init__(
-        self,
-        config: Optional[str] = None,
-        config_path: Optional[str] = None,
-        new_keys: bool = False,
-        delete_old_keys: bool = False,
-        ssl_verify: bool = True,
-        cert_auth: bool = False
+            self,
+            config: Optional[str] = None,
+            config_path: Optional[str] = None,
+            new_keys: bool = False,
+            delete_old_keys: bool = False,
+            ssl_verify: bool = True,
+            cert_auth: bool = False,
+            jwt_auth: bool = True
     ):
         """
         :param config: Config as a dictionary
@@ -62,6 +65,7 @@ class APIClient:
         self.ssl_verify = ssl_verify
         self.config = config
         self.cert_auth = cert_auth
+        self.jwt_auth = jwt_auth
         self.cert = None
         if config_path:
             self.config = configparser.ConfigParser()
@@ -76,10 +80,12 @@ class APIClient:
         self.server_url = self.config["PASSBOLT"]["SERVER"].rstrip("/")
 
         if self.cert_auth:
-            if not (self.config["PASSBOLT"]["SERVER_CERT_AUTH_CRT"] and self.config["PASSBOLT"]["SERVER_CERT_AUTH_KEY"]):
+            if not (self.config["PASSBOLT"]["SERVER_CERT_AUTH_CRT"] and self.config["PASSBOLT"][
+                "SERVER_CERT_AUTH_KEY"]):
                 raise ValueError("Missing certificate and key in config.ini")
-            self.cert = (self.config["PASSBOLT"]["SERVER_CERT_AUTH_CRT"], self.config["PASSBOLT"]["SERVER_CERT_AUTH_KEY"])
-        
+            self.cert = (self.config["PASSBOLT"]["SERVER_CERT_AUTH_CRT"],
+                         self.config["PASSBOLT"]["SERVER_CERT_AUTH_KEY"])
+
         self.user_fingerprint = self.config["PASSBOLT"]["USER_FINGERPRINT"].upper().replace(" ", "")
         self.gpg = gnupg.GPG()
         if delete_old_keys:
@@ -120,7 +126,54 @@ class APIClient:
         self.gpg.import_keys(open(self.config["PASSBOLT"]["USER_PRIVATE_KEY_FILE"]).read())
 
     def _login(self):
-        r = self.requests_session.post(self.server_url + LOGIN_URL, json={"gpg_auth": {"keyid": self.gpg_fingerprint}}, verify=self.ssl_verify, cert=self.cert) # None is the default value in requests
+        if self.jwt_auth:
+            self._login_jwt_auth()
+        else:
+            self._login_gpg_auth()
+
+    def _login_jwt_auth(self):
+        srv_fingerprint, srv_key = self.get_server_public_key()
+        if not any(key["fingerprint"] == srv_fingerprint for key in self.gpg.list_keys()):
+            self.gpg.import_keys(srv_key)
+        if "USER_ID" not in  self.config["PASSBOLT"]:
+            raise ValueError("Missing value for USER_ID (needed for JWT auth) in config.ini")
+        user_id = self.config["PASSBOLT"]["USER_ID"]
+        verify_token = str(uuid.uuid4())
+        challenge = {
+            "version": "1.0.0",
+            "domain": self.config["PASSBOLT"]["SERVER"],
+            # create a new uuid
+            "verify_token": verify_token,
+            # unix epoch for challenge expiration
+            "verify_token_expiry": str((datetime.datetime.now() + datetime.timedelta(seconds=30)).timestamp())
+        }
+        enc_challenge = self.gpg.encrypt(
+            json.dumps(challenge),
+            srv_fingerprint,
+            sign=self.gpg_fingerprint,
+            passphrase=self._get_passphrase(),
+            always_trust=True
+        )
+        login_resp = self.requests_session.post(self.server_url + "/auth/jwt/login.json", json={
+            "user_id": user_id,
+            "challenge": str(enc_challenge),
+        })
+        enc_challenge = login_resp.json()["body"]["challenge"]
+        decr_challenge = json.loads(str(self.gpg.decrypt(enc_challenge, passphrase=self._get_passphrase())))
+
+        if verify_token != decr_challenge["verify_token"]:
+            raise Exception("Verification tokens do not match in JWT auth!")
+
+        self.jwt_auth_token = decr_challenge["access_token"]
+        self.jwt_refresh_token = decr_challenge["refresh_token"]
+
+        self.requests_session.headers.update({
+            "Authorization": f"Bearer {self.jwt_auth_token}",
+        })
+
+    def _login_gpg_auth(self):
+        r = self.requests_session.post(self.server_url + LOGIN_URL, json={"gpg_auth": {"keyid": self.gpg_fingerprint}},
+                                       verify=self.ssl_verify, cert=self.cert)  # None is the default value in requests
         encrypted_token = r.headers["X-GPGAuth-User-Auth-Token"]
         encrypted_token = urllib.parse.unquote(encrypted_token)
         encrypted_token = encrypted_token.replace(r"\+", " ")
@@ -135,9 +188,9 @@ class APIClient:
             self._get_csrf_token()
         except requests.exceptions.HTTPError as e:
             if (
-                e.response.status_code != requests.status_codes.codes.forbidden
-                or e.response.json()["header"]["message"]
-                != "MFA authentication is required."
+                    e.response.status_code != requests.status_codes.codes.forbidden
+                    or e.response.json()["header"]["message"]
+                    != "MFA authentication is required."
             ):
                 logging.error(r.text)
                 raise e
@@ -150,17 +203,18 @@ class APIClient:
         r = self.requests_session.get(self.server_url + "/users/me.json")
         r.raise_for_status()
 
-    def encrypt(self, text, recipients=None):
-        return str(self.gpg.encrypt(data=text, recipients=recipients or self.gpg_fingerprint, always_trust=True))
-
-    def decrypt(self, text):
+    def _get_passphrase(self):
         if "PASSPHRASE" in self.config["PASSBOLT"]:
             passphrase = str(self.config["PASSBOLT"]["PASSPHRASE"])
         else:
             passphrase = None
+        return passphrase
 
+    def encrypt(self, text, recipients=None):
+        return str(self.gpg.encrypt(data=text, recipients=recipients or self.gpg_fingerprint, always_trust=True))
 
-        return str(self.gpg.decrypt(text, always_trust=True, passphrase=passphrase))
+    def decrypt(self, text):
+        return str(self.gpg.decrypt(text, always_trust=True, passphrase=self._get_passphrase()))
 
     def get_headers(self):
         return {
@@ -250,7 +304,7 @@ class PassboltAPI(APIClient):
         if resource_definition["secret"]["type"] == "string":
             return PassboltResourceType.PASSWORD
         if resource_definition["secret"]["type"] == "object" and set(
-            resource_definition["secret"]["properties"].keys()
+                resource_definition["secret"]["properties"].keys()
         ) == {"password", "description"}:
             return PassboltResourceType.PASSWORD_WITH_DESCRIPTION
         raise PassboltError("The resource type definition is not valid or supported yet. ")
@@ -312,7 +366,8 @@ class PassboltAPI(APIClient):
         return [user for user in self.list_users() if user.id in user_ids]
 
     def list_users(
-        self, resource_or_folder_id: Union[None, PassboltResourceIdType, PassboltFolderIdType] = None, force_list=True
+            self, resource_or_folder_id: Union[None, PassboltResourceIdType, PassboltFolderIdType] = None,
+            force_list=True
     ) -> List[PassboltUserTuple]:
         if resource_or_folder_id is None:
             params = {}
@@ -370,7 +425,7 @@ class PassboltAPI(APIClient):
         )
         assert "body" in response.keys(), f"Key 'body' not found in response keys: {response.keys()}"
         assert (
-            "permissions" in response["body"].keys()
+                "permissions" in response["body"].keys()
         ), f"Key 'body.permissions' not found in response: {response['body'].keys()}"
         return constructor(
             PassboltFolderTuple,
@@ -386,14 +441,14 @@ class PassboltAPI(APIClient):
         return r.json()
 
     def create_resource(
-        self,
-        name: str,
-        password: str,
-        username: str = "",
-        description: str = "",
-        uri: str = "",
-        resource_type_id: Optional[PassboltResourceTypeIdType] = None,
-        folder_id: Optional[PassboltFolderIdType] = None,
+            self,
+            name: str,
+            password: str,
+            username: str = "",
+            description: str = "",
+            uri: str = "",
+            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+            folder_id: Optional[PassboltFolderIdType] = None,
     ):
         """Creates a new resource on passbolt and shares it with the provided folder recipients"""
         if not name:
@@ -447,14 +502,14 @@ class PassboltAPI(APIClient):
         return resource
 
     def update_resource(
-        self,
-        resource_id: PassboltResourceIdType,
-        name: Optional[str] = None,
-        username: Optional[str] = None,
-        description: Optional[str] = None,
-        uri: Optional[str] = None,
-        resource_type_id: Optional[PassboltResourceTypeIdType] = None,
-        password: Optional[str] = None,
+            self,
+            resource_id: PassboltResourceIdType,
+            name: Optional[str] = None,
+            username: Optional[str] = None,
+            description: Optional[str] = None,
+            uri: Optional[str] = None,
+            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+            password: Optional[str] = None,
     ):
         resource: PassboltResourceTuple = self.read_resource(resource_id=resource_id)
         secret = self._get_secret(resource_id=resource_id)
