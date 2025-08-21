@@ -160,6 +160,11 @@ class APIClient:
             "user_id": user_id,
             "challenge": str(enc_challenge),
         })
+        login_resp.raise_for_status()
+        if "body" not in login_resp.json():
+            raise PassboltError("Login response does not contain 'body' key: " + str(login_resp.json()))
+        if "challenge" not in login_resp.json()["body"]:
+            raise PassboltError("Login response does not contain 'challenge' key: " + str(login_resp.json()))
         enc_challenge = login_resp.json()["body"]["challenge"]
         decr_challenge = json.loads(str(self.gpg.decrypt(enc_challenge, passphrase=self._get_passphrase())))
 
