@@ -4,6 +4,7 @@ import json
 import logging
 import urllib.parse
 import uuid
+from enum import verify
 from typing import List, Mapping, Optional, Tuple, Union
 
 import gnupg
@@ -161,7 +162,7 @@ class APIClient:
         login_resp = self.requests_session.post(self.server_url + "/auth/jwt/login.json", json={
             "user_id": user_id,
             "challenge": str(enc_challenge),
-        })
+        }, verify=self.ssl_verify)
         login_resp.raise_for_status()
         if "body" not in login_resp.json():
             raise PassboltError("Login response does not contain 'body' key: " + str(login_resp.json()))
@@ -220,9 +221,8 @@ class APIClient:
         return passphrase
 
     def _get_resource_types(self):
-        r = self.requests_session.get(self.server_url + '/resource-types.json')
-        r.raise_for_status()
-        types = r.json()["body"]
+        r = self.get('/resource-types.json')
+        types = r["body"]
         self.resource_type_map = {}
         for resource_type in types:
             self.resource_type_map[resource_type["id"]] = PassboltResourceTypeTuple(
@@ -240,10 +240,9 @@ class APIClient:
         )
 
     def _get_metadata_keys(self):
-        r = self.requests_session.get(self.server_url + '/metadata/keys.json',
+        r = self.get('/metadata/keys.json',
                                       params={'contain[metadata_private_keys]': 1})
-        r.raise_for_status()
-        r = r.json()["body"]
+        r = r["body"]
         pub_keys = []
         priv_keys = []
         for key in r:
@@ -281,7 +280,7 @@ class APIClient:
         }
 
     def get_server_public_key(self):
-        r = self.requests_session.get(self.server_url + VERIFY_URL)
+        r = self.requests_session.get(self.server_url + VERIFY_URL, verify=self.ssl_verify)
         return r.json()["body"]["fingerprint"], r.json()["body"]["keydata"]
 
     def delete(self, url):
@@ -294,7 +293,7 @@ class APIClient:
             raise e
 
     def get(self, url, return_response_object=False, **kwargs):
-        r = self.requests_session.get(self.server_url + url, headers=self.get_headers(), **kwargs)
+        r = self.requests_session.get(self.server_url + url, headers=self.get_headers(),verify=self.ssl_verify, **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -305,7 +304,7 @@ class APIClient:
             raise e
 
     def put(self, url, data, return_response_object=False, **kwargs):
-        r = self.requests_session.put(self.server_url + url, json=data, headers=self.get_headers(), **kwargs)
+        r = self.requests_session.put(self.server_url + url, json=data, headers=self.get_headers(), verify=self.ssl_verify, **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -316,7 +315,7 @@ class APIClient:
             raise e
 
     def post(self, url, data, return_response_object=False, **kwargs):
-        r = self.requests_session.post(self.server_url + url, json=data, headers=self.get_headers(), **kwargs)
+        r = self.requests_session.post(self.server_url + url, json=data, headers=self.get_headers(), verify=self.ssl_verify, **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -542,7 +541,7 @@ class PassboltAPI(APIClient):
                         folder_id: Optional[PassboltFolderIdType] = None,
                         plaintext: bool = False) -> PassboltResourceTuple:
         if plaintext:
-            create_resp = self._create_resource_plaintext(
+            create_resp, payload = self._create_resource_plaintext(
                 name=name,
                 password=password,
                 username=username,
@@ -551,7 +550,7 @@ class PassboltAPI(APIClient):
                 resource_type_id=resource_type_id,
             )
         else:
-            create_resp = self._create_resource_encrypted_metadata(
+            create_resp, payload = self._create_resource_encrypted(
                 name=name,
                 password=password,
                 username=username,
@@ -581,7 +580,7 @@ class PassboltAPI(APIClient):
             ]
             share_payload = {
                 "permissions": permissions,
-                "secrets": self._encrypt_secrets(password, lookup_users.values()),
+                "secrets": self._encrypt_secrets(payload, lookup_users.values()),
             }
             # simulate sharing with folder perms
             r_simulate = self.post(
@@ -592,14 +591,14 @@ class PassboltAPI(APIClient):
             self.move_resource_to_folder(resource_id=resource.id, folder_id=folder_id)
         return resource
 
-    def _create_resource_encrypted_metadata(self,
-                                            name: str,
-                                            password: str,
-                                            resource_type_id: PassboltResourceTypeIdType,
-                                            username: str = "",
-                                            description: str = "",
-                                            uris=None,
-                                            ):
+    def _create_resource_encrypted(self,
+                                   name: str,
+                                   password: str,
+                                   resource_type_id: PassboltResourceTypeIdType,
+                                   username: str = "",
+                                   description: str = "",
+                                   uris=None,
+                                   ):
         if uris is None:
             uris = []
         """Creates a new resource on passbolt and shares it with the provided folder recipients"""
@@ -625,6 +624,11 @@ class PassboltAPI(APIClient):
             "username": username,
         }
 
+        secret_data = {
+            'object_type': 'PASSBOLT_SECRET_DATA',
+            'password': password
+        }
+
         r_create = self.post(
             "/resources.json",
             {
@@ -633,11 +637,11 @@ class PassboltAPI(APIClient):
                 'metadata': self.encrypt(json.dumps(metadata),
                                          recipients=[self.metadata_keys[md_key_id]["fingerprint"]]),
                 **({"resource_type_id": resource_type_id} if resource_type_id else {}),
-                "secrets": [{"data": self.encrypt(password)}],
+                "secrets": [{"data": self.encrypt(json.dumps(secret_data))}],
             },
             return_response_object=True,
         )
-        return r_create.json()["body"]
+        return r_create.json()["body"], json.dumps(secret_data)
 
     def _create_resource_plaintext(
             self,
@@ -666,7 +670,7 @@ class PassboltAPI(APIClient):
             },
             return_response_object=True,
         )
-        return r_create.json()["body"]
+        return r_create.json()["body"], password
 
     def update_resource(
             self,
