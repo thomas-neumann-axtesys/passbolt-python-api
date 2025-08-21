@@ -156,6 +156,8 @@ class APIClient:
             passphrase=self._get_passphrase(),
             always_trust=True
         )
+        if not enc_challenge.ok:
+            raise PassboltError("Encryption failed: " + str(enc_challenge.stderr))
         login_resp = self.requests_session.post(self.server_url + "/auth/jwt/login.json", json={
             "user_id": user_id,
             "challenge": str(enc_challenge),
