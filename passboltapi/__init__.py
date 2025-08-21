@@ -262,11 +262,14 @@ class APIClient:
         return pub_keys, priv_keys
 
     def encrypt(self, text, recipients=None):
-        return str(self.gpg.encrypt(data=text, recipients=recipients or self.gpg_fingerprint, always_trust=True))
+        res = self.gpg.encrypt(data=text, recipients=recipients or self.gpg_fingerprint, always_trust=True)
+        if not res.ok:
+            raise PassboltError(f"Encryption failed: {res.stderr}")
+        return str(res)
 
     def decrypt(self, text):
         res = self.gpg.decrypt(text, always_trust=True, passphrase=self._get_passphrase())
-        if res.status != 'decryption ok':
+        if not res.ok:
             raise PassboltError(f"Decryption failed: {res.stderr}")
         return str(res)
 
@@ -411,6 +414,10 @@ class PassboltAPI(APIClient):
         assert "children_resources" in response.keys(), (
             f"Key 'body[].children_resources' not found in response " f"keys: {response.keys()} "
         )
+        for i in range(len(response["children_resources"])):
+            response["children_resources"][i] = self._decrypt_metadata_in_response(
+                response=response["children_resources"][i]
+            )
         return constructor(PassboltResourceTuple)(response["children_resources"])
 
     def list_users_with_folder_access(self, folder_id: PassboltFolderIdType) -> List[PassboltUserTuple]:
