@@ -66,6 +66,7 @@ class APIClient:
         self.config = config
         self.cert_auth = cert_auth
         self.jwt_auth = jwt_auth
+        self.metadata_keys = {}
         self.cert = None
         if config_path:
             self.config = configparser.ConfigParser()
@@ -102,6 +103,7 @@ class APIClient:
         if self.user_fingerprint not in [i["fingerprint"] for i in self.gpg.list_keys(True)]:
             raise Exception("GPG private key could not be found. Check: gpg --list-secret-keys")
         self._login()
+        self._get_resource_types()
 
     def __enter__(self):
         return self
@@ -135,7 +137,7 @@ class APIClient:
         srv_fingerprint, srv_key = self.get_server_public_key()
         if not any(key["fingerprint"] == srv_fingerprint for key in self.gpg.list_keys()):
             self.gpg.import_keys(srv_key)
-        if "USER_ID" not in  self.config["PASSBOLT"]:
+        if "USER_ID" not in self.config["PASSBOLT"]:
             raise ValueError("Missing value for USER_ID (needed for JWT auth) in config.ini")
         user_id = self.config["PASSBOLT"]["USER_ID"]
         verify_token = str(uuid.uuid4())
@@ -210,11 +212,56 @@ class APIClient:
             passphrase = None
         return passphrase
 
+    def _get_resource_types(self):
+        r = self.requests_session.get(self.server_url + '/resource-types.json')
+        r.raise_for_status()
+        types = r.json()["body"]
+        self.resource_type_map = {}
+        for resource_type in types:
+            self.resource_type_map[resource_type["id"]] = PassboltResourceTypeTuple(
+                id=resource_type["id"],
+                name=resource_type["name"],
+                slug=resource_type["slug"],
+                definition=resource_type["definition"],
+                created=PassboltDateTimeType(resource_type["created"]),
+                modified=PassboltDateTimeType(resource_type["modified"]),
+                description=resource_type.get("description", ""),
+            )
+        self.default_resource_type_id = next(
+            (rt.id for rt in self.resource_type_map.values() if rt.slug == "v5-default"),
+            None
+        )
+
+    def _get_metadata_keys(self):
+        r = self.requests_session.get(self.server_url + '/metadata/keys.json',
+                                      params={'contain[metadata_private_keys]': 1})
+        r.raise_for_status()
+        r = r.json()["body"]
+        pub_keys = []
+        priv_keys = []
+        for key in r:
+            pub_keys.append({
+                'armored_key': key['armored_key'],
+                'fingerprint': key['fingerprint'],
+            })
+            for pkey in key["metadata_private_keys"]:
+                key_data = json.loads(self.decrypt(pkey['data']))
+                self.metadata_keys[pkey["metadata_key_id"]] = {
+                    'key_data': key_data,
+                    'user_id': pkey['user_id'],
+                    'fingerprint': key['fingerprint']
+                }
+                priv_keys.append(key_data['armored_key'])
+        return pub_keys, priv_keys
+
     def encrypt(self, text, recipients=None):
         return str(self.gpg.encrypt(data=text, recipients=recipients or self.gpg_fingerprint, always_trust=True))
 
     def decrypt(self, text):
-        return str(self.gpg.decrypt(text, always_trust=True, passphrase=self._get_passphrase()))
+        res = self.gpg.decrypt(text, always_trust=True, passphrase=self._get_passphrase())
+        if res.status != 'decryption ok':
+            raise PassboltError(f"Decryption failed: {res.stderr}")
+        return str(res)
 
     def get_headers(self):
         return {
@@ -301,6 +348,8 @@ class PassboltAPI(APIClient):
     def _get_secret_type(self, resource_type_id: PassboltResourceTypeIdType) -> PassboltResourceType:
         resource_type: PassboltResourceTypeTuple = self.read_resource_type(resource_type_id=resource_type_id)
         resource_definition = json.loads(resource_type.definition)
+        if resource_type.slug == 'v5-password-string' or resource_type.id == self.default_resource_type_id:
+            return PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA
         if resource_definition["secret"]["type"] == "string":
             return PassboltResourceType.PASSWORD
         if resource_definition["secret"]["type"] == "object" and set(
@@ -318,6 +367,12 @@ class PassboltAPI(APIClient):
         elif secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION:
             pwd, desc = self._json_load_secret(secret=secret)
             return {"password": pwd, "description": desc}
+        elif secret_type == PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA:
+            # metadata should already be decrypted
+            return {
+                "password": self.decrypt(secret.data),
+                "description": resource.description
+            }
 
     def get_password(self, resource_id: PassboltResourceIdType) -> str:
         return self.get_password_and_description(resource_id=resource_id)["password"]
@@ -387,6 +442,17 @@ class PassboltAPI(APIClient):
             return [users]
         return users
 
+    def import_metadata_keys(self, trustlevel="TRUST_FULLY"):
+        """Imports metadata keys from the passbolt server and sets trust level."""
+        md_pub_keys, md_priv_keys = self._get_metadata_keys()
+        for key in md_pub_keys:
+            armored_key = key["armored_key"]
+            fingerprint = key["fingerprint"]
+            self.gpg.import_keys(armored_key)
+            self.gpg.trust_keys(fingerprint, trustlevel)
+        for key in md_priv_keys:
+            self.gpg.import_keys(key)
+
     def import_public_keys(self, trustlevel="TRUST_FULLY"):
         # get all users
         users = self.list_users()
@@ -394,9 +460,21 @@ class PassboltAPI(APIClient):
             self.gpg.import_keys(user.gpgkey.armored_key)
             self.gpg.trust_keys(user.gpgkey.fingerprint, trustlevel)
 
+    def _decrypt_metadata_in_response(self, response: dict) -> dict:
+        """Decrypts metadata in the response if it exists."""
+        if "metadata" in response:
+            metadata = json.loads(self.decrypt(response["metadata"]))
+            response["name"] = metadata["name"]
+            response["description"] = metadata.get("description", "")
+            uris = metadata.get("uris", [])
+            response["uri"] = len(uris) > 0 and uris[0] or ""
+            response["username"] = metadata.get("username", "")
+        return response
+
     def read_resource(self, resource_id: PassboltResourceIdType) -> PassboltResourceTuple:
         response = self.get(f"/resources/{resource_id}.json", return_response_object=True)
         response = response.json()["body"]
+        response = self._decrypt_metadata_in_response(response)
         return constructor(PassboltResourceTuple)(response)
 
     def read_resource_type(self, resource_type_id: PassboltResourceTypeIdType) -> PassboltResourceTypeTuple:
@@ -440,35 +518,34 @@ class PassboltAPI(APIClient):
         )
         return r.json()
 
-    def create_resource(
-            self,
-            name: str,
-            password: str,
-            username: str = "",
-            description: str = "",
-            uri: str = "",
-            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
-            folder_id: Optional[PassboltFolderIdType] = None,
-    ):
-        """Creates a new resource on passbolt and shares it with the provided folder recipients"""
-        if not name:
-            raise PassboltValidationError(f"Name cannot be None or empty -- {name}!")
-        if not password:
-            raise PassboltValidationError(f"Password cannot be None or empty -- {password}!")
-
-        r_create = self.post(
-            "/resources.json",
-            {
-                "name": name,
-                "username": username,
-                "description": description,
-                "uri": uri,
-                **({"resource_type_id": resource_type_id} if resource_type_id else {}),
-                "secrets": [{"data": self.encrypt(password)}],
-            },
-            return_response_object=True,
-        )
-        resource = constructor(PassboltResourceTuple)(r_create.json()["body"])
+    def create_resource(self,
+                        name: str,
+                        password: str,
+                        username: str = "",
+                        description: str = "",
+                        uri: str = "",
+                        resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+                        folder_id: Optional[PassboltFolderIdType] = None,
+                        plaintext: bool = False) -> PassboltResourceTuple:
+        if plaintext:
+            create_resp = self._create_resource_plaintext(
+                name=name,
+                password=password,
+                username=username,
+                description=description,
+                uri=uri,
+                resource_type_id=resource_type_id,
+            )
+        else:
+            create_resp = self._create_resource_encrypted_metadata(
+                name=name,
+                password=password,
+                username=username,
+                description=description,
+                uris=[uri] if uri else [],
+                resource_type_id=resource_type_id,
+            )
+        resource = constructor(PassboltResourceTuple)(create_resp)
         if folder_id:
             folder = self.read_folder(folder_id)
             # get users with access to folder
@@ -501,7 +578,173 @@ class PassboltAPI(APIClient):
             self.move_resource_to_folder(resource_id=resource.id, folder_id=folder_id)
         return resource
 
+    def _create_resource_encrypted_metadata(self,
+                                            name: str,
+                                            password: str,
+                                            resource_type_id: PassboltResourceTypeIdType,
+                                            username: str = "",
+                                            description: str = "",
+                                            uris=None,
+                                            ):
+        if uris is None:
+            uris = []
+        """Creates a new resource on passbolt and shares it with the provided folder recipients"""
+        if not name:
+            raise PassboltValidationError(f"Name cannot be None or empty -- {name}!")
+        if not password:
+            raise PassboltValidationError(f"Password cannot be None or empty -- {password}!")
+        if not resource_type_id:
+            resource_type_id = self.default_resource_type_id
+
+        # get first metadata key
+        # TODO: Only supporting shared key metadata for now
+        md_key_id = list(self.metadata_keys.keys())[0] if self.metadata_keys else None
+        if md_key_id is None:
+            raise PassboltValidationError("No metadata keys found. Please import metadata keys first.")
+
+        metadata = {
+            'object_type': 'PASSBOLT_RESOURCE_METADATA',
+            'resource_type_id': resource_type_id,
+            "name": name,
+            "description": description,
+            "uris": uris,
+            "username": username,
+        }
+
+        r_create = self.post(
+            "/resources.json",
+            {
+                'metadata_key_id': md_key_id,
+                'metadata_key_type': 'shared_key',
+                'metadata': self.encrypt(json.dumps(metadata),
+                                         recipients=[self.metadata_keys[md_key_id]["fingerprint"]]),
+                **({"resource_type_id": resource_type_id} if resource_type_id else {}),
+                "secrets": [{"data": self.encrypt(password)}],
+            },
+            return_response_object=True,
+        )
+        return r_create.json()["body"]
+
+    def _create_resource_plaintext(
+            self,
+            name: str,
+            password: str,
+            username: str = "",
+            description: str = "",
+            uri: str = "",
+            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+    ):
+        """Creates a new resource on passbolt and shares it with the provided folder recipients"""
+        if not name:
+            raise PassboltValidationError(f"Name cannot be None or empty -- {name}!")
+        if not password:
+            raise PassboltValidationError(f"Password cannot be None or empty -- {password}!")
+
+        r_create = self.post(
+            "/resources.json",
+            {
+                "name": name,
+                "username": username,
+                "description": description,
+                "uri": uri,
+                **({"resource_type_id": resource_type_id} if resource_type_id else {}),
+                "secrets": [{"data": self.encrypt(password)}],
+            },
+            return_response_object=True,
+        )
+        return r_create.json()["body"]
+
     def update_resource(
+            self,
+            resource_id: PassboltResourceIdType,
+            name: Optional[str] = None,
+            username: Optional[str] = None,
+            description: Optional[str] = None,
+            uri: Optional[str] = None,
+            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+            password: Optional[str] = None,
+            plaintext: bool = False,
+    ):
+        if plaintext:
+            return self._update_resource_plaintext(
+                resource_id=resource_id,
+                name=name,
+                username=username,
+                description=description,
+                uri=uri,
+                resource_type_id=resource_type_id,
+                password=password,
+            )
+        else :
+            return self._update_resource_encrypted_metadata(
+                resource_id=resource_id,
+                name=name,
+                username=username,
+                description=description,
+                uris=[uri] if uri else [],
+                resource_type_id=resource_type_id,
+                password=password,
+            )
+
+    def _update_resource_encrypted_metadata(
+            self,
+            resource_id: PassboltResourceIdType,
+            name: Optional[str] = None,
+            username: Optional[str] = None,
+            description: Optional[str] = None,
+            uris: List[str] = None,
+            resource_type_id: Optional[PassboltResourceTypeIdType] = None,
+            password: Optional[str] = None):
+        if uris is None:
+            uris = []
+
+        # get first metadata key
+        # TODO: Only supporting shared key metadata for now
+        md_key_id = list(self.metadata_keys.keys())[0] if self.metadata_keys else None
+        if md_key_id is None:
+            raise PassboltValidationError("No metadata keys found. Please import metadata keys first.")
+
+        resource: PassboltResourceTuple = self.read_resource(resource_id=resource_id)
+        secret_type = self._get_secret_type(resource_type_id=resource.resource_type_id)
+        if secret_type != PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA:
+            raise PassboltError(
+                f"Resource type {resource.resource_type_id} is not supported for encrypted metadata update."
+            )
+        resource_type_id = resource_type_id if resource_type_id else resource.resource_type_id
+        payload = {
+            "resource_type_id": resource_type_id,
+        }
+
+        recipients = self.list_users(resource_or_folder_id=resource_id)
+        if password:
+            assert isinstance(password, str), f"password has to be a string object -- {password}"
+            payload["secrets"] = self._encrypt_secrets(secret_text=password, recipients=recipients)
+
+        metadata = json.loads(self.decrypt(resource.metadata))
+        if name is not None:
+            metadata["name"] = name
+        if username is not None:
+            metadata["username"] = username
+        if description is not None:
+            metadata["description"] = description
+        for i, uri in enumerate(uris):
+            if i < len(metadata["uris"]):
+                metadata["uris"][i] = uri
+            else:
+                metadata["uris"].append(uri)
+        metadata["resource_type_id"] = resource_type_id
+        metadata = self.encrypt(json.dumps(metadata),
+                                         recipients=[self.metadata_keys[md_key_id]["fingerprint"]])
+        payload["metadata"] = metadata
+        payload["metadata_key_id"] = md_key_id
+        payload["metadata_key_type"] = "shared_key"
+
+        if payload:
+            r = self.put(f"/resources/{resource_id}.json", payload, return_response_object=True)
+            return r
+        return None
+
+    def _update_resource_plaintext(
             self,
             resource_id: PassboltResourceIdType,
             name: Optional[str] = None,

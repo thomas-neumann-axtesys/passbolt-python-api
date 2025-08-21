@@ -32,6 +32,7 @@ PassboltFavoriteDetailsType: TypeAlias = dict
 class PassboltResourceType(Enum):
     PASSWORD = 1
     PASSWORD_WITH_DESCRIPTION = 2
+    PASSWORD_WITH_ENCRYPTED_METADATA = 3
 
 
 class PassboltSecretTuple(NamedTuple):
@@ -89,28 +90,39 @@ class PassboltResourceTuple(NamedTuple):
     created: PassboltDateTimeType
     created_by: PassboltUserIdType
     deleted: bool
-    description: str
     modified: PassboltDateTimeType
     modified_by: PassboltUserIdType
-    name: str
-    uri: str
-    username: str
     resource_type_id: PassboltResourceIdType
     folder_parent_id: PassboltFolderIdType
+
+    # Legacy cleartext fields
+    description: Optional[str] = None
+    name: Optional[str] = None
+    uri: Optional[str] = None
+    username: Optional[str] = None
+    # Encrypted metadata (contains previously mentioned fields)
+    metadata: Optional[str] = None
     creator: Union[None, PassboltUserTuple] = None
     favorite: Union[None, PassboltFavoriteDetailsType] = None
     modifier: Union[None, PassboltUserTuple] = None
     permission: Union[PassboltPermissionTuple] = None
 
+class PassboltMetadataTuple(NamedTuple):
+    name: str
+    resource_type_id: PassboltResourceTypeIdType
+    object_type: Literal['PASSBOLT_RESOURCE_METADATA']
+    description: Optional[str] = None
+    username: Optional[str] = None
+    uris: List[str] = []
 
 class PassboltResourceTypeTuple(NamedTuple):
     id: str
     slug: str
-    name: str
-    description: str
     definition: str
     created: str
     modified: str
+    name: str
+    description: str
 
 
 class PassboltFolderTuple(NamedTuple):
