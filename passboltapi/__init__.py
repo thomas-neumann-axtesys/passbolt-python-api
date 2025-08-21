@@ -141,9 +141,13 @@ class APIClient:
             raise ValueError("Missing value for USER_ID (needed for JWT auth) in config.ini")
         user_id = self.config["PASSBOLT"]["USER_ID"]
         verify_token = str(uuid.uuid4())
+        # force https for domain
+        domain = self.config["PASSBOLT"]["SERVER"]
+        if not domain.startswith("https://"):
+            domain = "https://{}".format(domain.lstrip("http://").rstrip("/"))
         challenge = {
             "version": "1.0.0",
-            "domain": self.config["PASSBOLT"]["SERVER"],
+            "domain": domain,
             # create a new uuid
             "verify_token": verify_token,
             # unix epoch for challenge expiration
