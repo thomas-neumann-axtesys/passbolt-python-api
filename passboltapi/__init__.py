@@ -735,7 +735,11 @@ class PassboltAPI(APIClient):
         recipients = self.list_users(resource_or_folder_id=resource_id)
         if password:
             assert isinstance(password, str), f"password has to be a string object -- {password}"
-            payload["secrets"] = self._encrypt_secrets(secret_text=password, recipients=recipients)
+            secret_data = {
+                'object_type': 'PASSBOLT_SECRET_DATA',
+                'password': password
+            }
+            payload["secrets"] = self._encrypt_secrets(secret_text=json.dumps(secret_data), recipients=recipients)
 
         metadata = json.loads(self.decrypt(resource.metadata))
         if name is not None:
