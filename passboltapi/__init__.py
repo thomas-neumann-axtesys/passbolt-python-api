@@ -4,7 +4,6 @@ import json
 import logging
 import urllib.parse
 import uuid
-from enum import verify
 from typing import List, Mapping, Optional, Tuple, Union
 
 import gnupg
