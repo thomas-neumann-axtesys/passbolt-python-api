@@ -735,9 +735,9 @@ class PassboltAPI(APIClient):
 
         resource: PassboltResourceTuple = self.read_resource(resource_id=resource_id)
         secret_type = self._get_secret_type(resource_type_id=resource.resource_type_id)
-        if secret_type != PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA:
+        if secret_type != PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA and secret_type != PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
             raise PassboltError(
-                f"Resource type {resource.resource_type_id} is not supported for encrypted metadata update."
+                f"Resource type {resource.resource_type_id} is not supported for this update method (encrypted)."
             )
         resource_type_id = resource_type_id if resource_type_id else resource.resource_type_id
         payload = {
