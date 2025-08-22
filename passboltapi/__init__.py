@@ -641,10 +641,10 @@ class PassboltAPI(APIClient):
         }
 
         if secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
-            secret_data = {
+            secret_data = json.dumps({
                 'object_type': 'PASSBOLT_SECRET_DATA',
                 'password': password
-            }
+            })
         elif secret_type == PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA:
             secret_data = password
 
@@ -656,11 +656,11 @@ class PassboltAPI(APIClient):
                 'metadata': self.encrypt(json.dumps(metadata),
                                          recipients=[self.metadata_keys[md_key_id]["fingerprint"]]),
                 **({"resource_type_id": resource_type_id} if resource_type_id else {}),
-                "secrets": [{"data": self.encrypt(json.dumps(secret_data))}],
+                "secrets": [{"data": self.encrypt(secret_data)}],
             },
             return_response_object=True,
         )
-        return r_create.json()["body"], json.dumps(secret_data)
+        return r_create.json()["body"], secret_data
 
     def _create_resource_plaintext(
             self,
@@ -756,13 +756,13 @@ class PassboltAPI(APIClient):
         if password:
             assert isinstance(password, str), f"password has to be a string object -- {password}"
             if secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
-                secret_data = {
+                secret_data = json.dumps({
                     'object_type': 'PASSBOLT_SECRET_DATA',
                     'password': password
-                }
+                })
             else:
                 secret_data = password
-            payload["secrets"] = self._encrypt_secrets(secret_text=json.dumps(secret_data), recipients=recipients)
+            payload["secrets"] = self._encrypt_secrets(secret_text=secret_data, recipients=recipients)
 
         metadata = json.loads(self.decrypt(resource.metadata))
         if name is not None:
