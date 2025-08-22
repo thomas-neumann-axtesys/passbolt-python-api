@@ -244,7 +244,7 @@ class APIClient:
 
     def _get_metadata_keys(self):
         r = self.get('/metadata/keys.json',
-                                      params={'contain[metadata_private_keys]': 1})
+                     params={'contain[metadata_private_keys]': 1})
         r = r["body"]
         pub_keys = []
         priv_keys = []
@@ -296,7 +296,8 @@ class APIClient:
             raise e
 
     def get(self, url, return_response_object=False, **kwargs):
-        r = self.requests_session.get(self.server_url + url, headers=self.get_headers(),verify=self.ssl_verify, **kwargs)
+        r = self.requests_session.get(self.server_url + url, headers=self.get_headers(), verify=self.ssl_verify,
+                                      **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -307,7 +308,8 @@ class APIClient:
             raise e
 
     def put(self, url, data, return_response_object=False, **kwargs):
-        r = self.requests_session.put(self.server_url + url, json=data, headers=self.get_headers(), verify=self.ssl_verify, **kwargs)
+        r = self.requests_session.put(self.server_url + url, json=data, headers=self.get_headers(),
+                                      verify=self.ssl_verify, **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -318,7 +320,8 @@ class APIClient:
             raise e
 
     def post(self, url, data, return_response_object=False, **kwargs):
-        r = self.requests_session.post(self.server_url + url, json=data, headers=self.get_headers(), verify=self.ssl_verify, **kwargs)
+        r = self.requests_session.post(self.server_url + url, json=data, headers=self.get_headers(),
+                                       verify=self.ssl_verify, **kwargs)
         try:
             r.raise_for_status()
             if return_response_object:
@@ -620,6 +623,8 @@ class PassboltAPI(APIClient):
         if not resource_type_id:
             resource_type_id = self.default_resource_type_id
 
+        secret_type = self._get_secret_type(resource_type_id=resource_type_id)
+
         # get first metadata key
         # TODO: Only supporting shared key metadata for now
         md_key_id = list(self.metadata_keys.keys())[0] if self.metadata_keys else None
@@ -635,10 +640,13 @@ class PassboltAPI(APIClient):
             "username": username,
         }
 
-        secret_data = {
-            'object_type': 'PASSBOLT_SECRET_DATA',
-            'password': password
-        }
+        if secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
+            secret_data = {
+                'object_type': 'PASSBOLT_SECRET_DATA',
+                'password': password
+            }
+        elif secret_type == PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA:
+            secret_data = password
 
         r_create = self.post(
             "/resources.json",
@@ -704,7 +712,7 @@ class PassboltAPI(APIClient):
                 resource_type_id=resource_type_id,
                 password=password,
             )
-        else :
+        else:
             return self._update_resource_encrypted_metadata(
                 resource_id=resource_id,
                 name=name,
@@ -747,10 +755,13 @@ class PassboltAPI(APIClient):
         recipients = self.list_users(resource_or_folder_id=resource_id)
         if password:
             assert isinstance(password, str), f"password has to be a string object -- {password}"
-            secret_data = {
-                'object_type': 'PASSBOLT_SECRET_DATA',
-                'password': password
-            }
+            if secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
+                secret_data = {
+                    'object_type': 'PASSBOLT_SECRET_DATA',
+                    'password': password
+                }
+            else:
+                secret_data = password
             payload["secrets"] = self._encrypt_secrets(secret_text=json.dumps(secret_data), recipients=recipients)
 
         metadata = json.loads(self.decrypt(resource.metadata))
@@ -767,7 +778,7 @@ class PassboltAPI(APIClient):
                 metadata["uris"].append(uri)
         metadata["resource_type_id"] = resource_type_id
         metadata = self.encrypt(json.dumps(metadata),
-                                         recipients=[self.metadata_keys[md_key_id]["fingerprint"]])
+                                recipients=[self.metadata_keys[md_key_id]["fingerprint"]])
         payload["metadata"] = metadata
         payload["metadata_key_id"] = md_key_id
         payload["metadata_key_type"] = "shared_key"
