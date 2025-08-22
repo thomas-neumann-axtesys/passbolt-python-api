@@ -33,6 +33,7 @@ class PassboltResourceType(Enum):
     PASSWORD = 1
     PASSWORD_WITH_DESCRIPTION = 2
     PASSWORD_WITH_ENCRYPTED_METADATA = 3
+    PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA = 4
 
 
 class PassboltSecretTuple(NamedTuple):

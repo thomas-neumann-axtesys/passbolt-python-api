@@ -360,8 +360,10 @@ class PassboltAPI(APIClient):
     def _get_secret_type(self, resource_type_id: PassboltResourceTypeIdType) -> PassboltResourceType:
         resource_type: PassboltResourceTypeTuple = self.read_resource_type(resource_type_id=resource_type_id)
         resource_definition = json.loads(resource_type.definition)
-        if resource_type.slug == 'v5-password-string' or resource_type.id == self.default_resource_type_id:
+        if resource_type.slug == 'v5-password-string':
             return PassboltResourceType.PASSWORD_WITH_ENCRYPTED_METADATA
+        if resource_type.slug == 'v5-default':
+            return PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA
         if resource_definition["secret"]["type"] == "string":
             return PassboltResourceType.PASSWORD
         if resource_definition["secret"]["type"] == "object" and set(
@@ -384,6 +386,12 @@ class PassboltAPI(APIClient):
             return {
                 "password": self.decrypt(secret.data),
                 "description": resource.description
+            }
+        elif secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
+            pwd, desc = self._json_load_secret(secret=secret)
+            return {
+                "password": pwd,
+                "description": desc
             }
 
     def get_password(self, resource_id: PassboltResourceIdType) -> str:
