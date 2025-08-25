@@ -391,10 +391,10 @@ class PassboltAPI(APIClient):
                 "description": resource.description
             }
         elif secret_type == PassboltResourceType.PASSWORD_WITH_DESCRIPTION_AND_ENCRYPTED_METADATA:
-            pwd, desc = self._json_load_secret(secret=secret)
+            sc_dict = json.loads(self.decrypt(secret.data))
             return {
-                "password": pwd,
-                "description": desc
+                "password": sc_dict["password"],
+                "description": sc_dict["description"] if "description" in sc_dict else None
             }
 
     def get_password(self, resource_id: PassboltResourceIdType) -> str:
