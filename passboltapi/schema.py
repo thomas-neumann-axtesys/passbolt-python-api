@@ -43,6 +43,10 @@ class PassboltSecretTuple(NamedTuple):
     data: str
     created: PassboltDateTimeType
     modified: PassboltDateTimeType
+    secret_revision_id: str
+    deleted: bool
+    created_by: str
+    modified_by: str
 
 
 class PassboltPermissionTuple(NamedTuple):
