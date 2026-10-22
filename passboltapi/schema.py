@@ -85,7 +85,7 @@ class PassboltUserTuple(NamedTuple):
     username: str
     role_id: PassboltRoleIdType
     profile: dict
-    last_logged_in: PassboltDateTimeType
+    last_logged_in: Optional[PassboltDateTimeType] = None
     role: Optional[dict] = None
     gpgkey: Optional[PassboltOpenPgpKeyTuple] = None
 
